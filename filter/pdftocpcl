@@ -1,0 +1,202 @@
+#!/usr/bin/env python3
+"""
+CUPS 过滤器: PDF → CPCL
+适用于: HPRT HM-A300 / HM-T300 移动打印机
+协议: CPCL (Comtec Printer Control Language)
+用法: pdftocpcl job-id user title copies options [file]
+"""
+
+import sys
+import os
+import subprocess
+import tempfile
+import shutil
+
+# ── 打印机参数 ──────────────────────────────────────────────
+PRINTER_DPI         = 200     # 打印机分辨率
+PRINTABLE_WIDTH_MM  = 72.0    # 可打印宽度 (80mm 纸约 72mm)
+PRINTABLE_WIDTH_PX  = int(PRINTABLE_WIDTH_MM / 25.4 * PRINTER_DPI)  # ≈566 像素
+# ────────────────────────────────────────────────────────────
+
+
+def log(msg):
+    sys.stderr.write(f"DEBUG: pdftocpcl: {msg}\n")
+    sys.stderr.flush()
+
+
+def error(msg):
+    sys.stderr.write(f"ERROR: pdftocpcl: {msg}\n")
+    sys.stderr.flush()
+
+
+def pdf_page_size_pts(pdf_path):
+    """返回 PDF 第一页尺寸 (width_pts, height_pts)"""
+    try:
+        result = subprocess.run(
+            ["pdfinfo", pdf_path],
+            capture_output=True, text=True, check=True
+        )
+        for line in result.stdout.splitlines():
+            if "Page size" in line:
+                # 格式: Page size:  121.88 x 70.86 pts
+                parts = line.split()
+                return float(parts[2]), float(parts[4])
+    except Exception as e:
+        log(f"pdfinfo 失败: {e}")
+    return None, None
+
+
+def render_pdf_to_pbm(pdf_path, render_dpi, tmpdir):
+    """用 pdftoppm 将 PDF 渲染为单色 PBM 文件列表"""
+    out_prefix = os.path.join(tmpdir, "page")
+    subprocess.run(
+        ["pdftoppm", "-r", str(render_dpi), "-mono", pdf_path, out_prefix],
+        check=True,
+        stderr=subprocess.DEVNULL
+    )
+    files = sorted([
+        os.path.join(tmpdir, f)
+        for f in os.listdir(tmpdir)
+        if f.startswith("page") and f.endswith(".pbm")
+    ])
+    return files
+
+
+def read_pbm(path):
+    """
+    读取 P4 (二进制单色) PBM 文件。
+    返回 (width, height, rows)
+    rows: list of bytearray，每行 ceil(width/8) 字节，1=黑 0=白
+    """
+    with open(path, "rb") as f:
+        raw = f.read()
+
+    # 解析头部
+    pos = 0
+    tokens = []
+    while len(tokens) < 3:
+        # 跳过空白
+        while pos < len(raw) and raw[pos:pos+1] in (b' ', b'\t', b'\r', b'\n'):
+            pos += 1
+        if pos >= len(raw):
+            break
+        # 跳过注释
+        if raw[pos:pos+1] == b'#':
+            while pos < len(raw) and raw[pos:pos+1] != b'\n':
+                pos += 1
+            continue
+        # 读取 token
+        start = pos
+        while pos < len(raw) and raw[pos:pos+1] not in (b' ', b'\t', b'\r', b'\n'):
+            pos += 1
+        tokens.append(raw[start:pos].decode('ascii'))
+
+    assert tokens[0] == 'P4', f"不是 P4 格式: {tokens[0]}"
+    width  = int(tokens[1])
+    height = int(tokens[2])
+
+    # 跳过头部最后一个空白字符
+    if pos < len(raw) and raw[pos:pos+1] in (b' ', b'\t', b'\r', b'\n'):
+        pos += 1
+
+    row_bytes = (width + 7) // 8
+    rows = [bytearray(raw[pos + r * row_bytes : pos + (r + 1) * row_bytes])
+            for r in range(height)]
+    return width, height, rows
+
+
+def build_cpcl(width_px, height_px, rows):
+    """
+    构建 CPCL EG (EXPANDED-GRAPHICS) 打印命令。
+
+    CPCL 格式:
+      ! 0 {h-dpi} {v-dpi} {height} {qty}\\r\\n
+      EG {byte-width} {dot-height} {x} {y} {hex-data}\\r\\n
+      FORM\\r\\n
+      PRINT\\r\\n
+    """
+    w_bytes = (min(width_px, PRINTABLE_WIDTH_PX) + 7) // 8
+
+    # 构建 hex 数据（每字节→2个十六进制字符）
+    hex_parts = []
+    for row in rows:
+        row_data = bytes(row[:w_bytes]).ljust(w_bytes, b'\x00')
+        hex_parts.append(row_data.hex().upper())
+    hex_data = "".join(hex_parts)
+
+    lines = [
+        f"! 0 {PRINTER_DPI} {PRINTER_DPI} {height_px} 1",
+        f"EG {w_bytes} {height_px} 0 0 {hex_data}",
+        "FORM",
+        "PRINT",
+    ]
+    return "\r\n".join(lines) + "\r\n"
+
+
+def main():
+    # CUPS 过滤器参数: job-id user title copies options [file]
+    if len(sys.argv) < 6:
+        sys.stderr.write(
+            "Usage: pdftocpcl job-id user title copies options [file]\n"
+        )
+        sys.exit(1)
+
+    options = sys.argv[5]
+    log(f"任务选项: {options}")
+
+    tmpdir = tempfile.mkdtemp(prefix="pdftocpcl_")
+    try:
+        # 获取输入文件
+        if len(sys.argv) == 7:
+            input_pdf = sys.argv[6]
+        else:
+            # 从 stdin 读取到临时文件
+            input_pdf = os.path.join(tmpdir, "input.pdf")
+            with open(input_pdf, "wb") as f:
+                f.write(sys.stdin.buffer.read())
+
+        # 获取 PDF 尺寸
+        w_pts, h_pts = pdf_page_size_pts(input_pdf)
+        if w_pts is None:
+            error("无法获取 PDF 尺寸，使用默认 DPI")
+            render_dpi = PRINTER_DPI
+        else:
+            w_mm = w_pts / 72.0 * 25.4
+            h_mm = h_pts / 72.0 * 25.4
+            log(f"PDF 尺寸: {w_mm:.1f}mm x {h_mm:.1f}mm")
+            # 缩放 DPI 使内容铺满打印宽度
+            render_dpi = int(PRINTER_DPI * (PRINTABLE_WIDTH_MM / w_mm))
+            log(f"渲染 DPI: {render_dpi} (缩放比 {render_dpi/PRINTER_DPI:.2f}x)")
+
+        # 渲染 PDF 为位图
+        pbm_files = render_pdf_to_pbm(input_pdf, render_dpi, tmpdir)
+        if not pbm_files:
+            error("未生成任何页面")
+            sys.exit(1)
+
+        log(f"共 {len(pbm_files)} 页")
+
+        # 逐页转换并输出 CPCL
+        for i, pbm in enumerate(pbm_files):
+            width, height, rows = read_pbm(pbm)
+            log(f"第 {i+1} 页: {width}x{height}px ({width/PRINTER_DPI*25.4:.1f}x{height/PRINTER_DPI*25.4:.1f}mm)")
+            cpcl = build_cpcl(width, height, rows)
+            sys.stdout.buffer.write(cpcl.encode('ascii'))
+
+        log("转换完成")
+        sys.exit(0)
+
+    except subprocess.CalledProcessError as e:
+        error(f"外部命令失败: {e}")
+        sys.exit(1)
+    except Exception as e:
+        error(f"未预期错误: {e}")
+        import traceback
+        traceback.print_exc(file=sys.stderr)
+        sys.exit(1)
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,106 @@
+*PPD-Adobe: "4.3"
+*%
+*% HPRT HM-A300 系列移动蓝牙标签打印机
+*% 适用型号: HM-A300 / HM-A300E / HM-A300S / HM-T300
+*% 协议: CPCL | 分辨率: 200 DPI | 纸宽: 80mm
+*%
+
+*FormatVersion:     "4.3"
+*FileVersion:       "1.1"
+*LanguageVersion:   English
+*LanguageEncoding:  ISOLatin1
+*PCFileName:        "HPRT_HM-A300-Series.ppd"
+
+*Manufacturer:      "HPRT"
+*Product:           "(HM-A300 Series)"
+*ModelName:         "HPRT HM-A300 Series"
+*ShortNickName:     "HPRT HM-A300 Series"
+*NickName:          "HPRT HM-A300/A300E/T300 CPCL Bluetooth"
+*PSVersion:         "(3010.000) 0"
+
+*LanguageLevel:     "3"
+*ColorDevice:       False
+*DefaultColorSpace: Gray
+*Throughput:        "1"
+*LandscapeOrientation: Plus90
+*TTRasterizer:      Type42
+
+*% ── CUPS 过滤器 ─────────────────────────────────────────
+*cupsVersion:       1.4
+*cupsModelNumber:   0
+*cupsManualCopies:  True
+*cupsFilter:        "application/pdf 0 pdftocpcl"
+
+*% ── 分辨率 ──────────────────────────────────────────────
+*OpenUI *Resolution/分辨率: PickOne
+*OrderDependency: 10 AnySetup *Resolution
+*DefaultResolution: 200dpi
+*Resolution 200dpi/200 DPI: "<</HWResolution[200 200]>>setpagedevice"
+*CloseUI: *Resolution
+
+*% ── 纸张尺寸 (物理尺寸 80mm x 各种高度) ─────────────────
+*% 单位: PostScript 点 (1pt = 1/72 inch)
+*% 80mm = 226.77pt  40mm = 113.39pt  50mm = 141.73pt
+*% 60mm = 170.08pt  75mm = 212.60pt 100mm = 283.46pt
+*% 120mm = 340.16pt 150mm = 425.20pt
+
+*OpenUI *PageSize/纸张尺寸: PickOne
+*OrderDependency: 20 AnySetup *PageSize
+*DefaultPageSize: w227h284
+*PageSize w227h142/80mm x 50mm:   "<</PageSize[227 142]>>setpagedevice"
+*PageSize w227h170/80mm x 60mm:   "<</PageSize[227 170]>>setpagedevice"
+*PageSize w227h213/80mm x 75mm:   "<</PageSize[227 213]>>setpagedevice"
+*PageSize w227h284/80mm x 100mm:  "<</PageSize[227 284]>>setpagedevice"
+*PageSize w227h340/80mm x 120mm:  "<</PageSize[227 340]>>setpagedevice"
+*PageSize w227h425/80mm x 150mm:  "<</PageSize[227 425]>>setpagedevice"
+*PageSize w227h567/80mm x 200mm:  "<</PageSize[227 567]>>setpagedevice"
+*CloseUI: *PageSize
+
+*OpenUI *PageRegion/纸张区域: PickOne
+*OrderDependency: 20 AnySetup *PageRegion
+*DefaultPageRegion: w227h284
+*PageRegion w227h142/80mm x 50mm:   "<</PageSize[227 142]>>setpagedevice"
+*PageRegion w227h170/80mm x 60mm:   "<</PageSize[227 170]>>setpagedevice"
+*PageRegion w227h213/80mm x 75mm:   "<</PageSize[227 213]>>setpagedevice"
+*PageRegion w227h284/80mm x 100mm:  "<</PageSize[227 284]>>setpagedevice"
+*PageRegion w227h340/80mm x 120mm:  "<</PageSize[227 340]>>setpagedevice"
+*PageRegion w227h425/80mm x 150mm:  "<</PageSize[227 425]>>setpagedevice"
+*PageRegion w227h567/80mm x 200mm:  "<</PageSize[227 567]>>setpagedevice"
+*CloseUI: *PageRegion
+
+*DefaultImageableArea: w227h284
+*ImageableArea w227h142/80mm x 50mm:   "0 0 227 142"
+*ImageableArea w227h170/80mm x 60mm:   "0 0 227 170"
+*ImageableArea w227h213/80mm x 75mm:   "0 0 227 213"
+*ImageableArea w227h284/80mm x 100mm:  "0 0 227 284"
+*ImageableArea w227h340/80mm x 120mm:  "0 0 227 340"
+*ImageableArea w227h425/80mm x 150mm:  "0 0 227 425"
+*ImageableArea w227h567/80mm x 200mm:  "0 0 227 567"
+
+*DefaultPaperDimension: w227h284
+*PaperDimension w227h142/80mm x 50mm:   "227 142"
+*PaperDimension w227h170/80mm x 60mm:   "227 170"
+*PaperDimension w227h213/80mm x 75mm:   "227 213"
+*PaperDimension w227h284/80mm x 100mm:  "227 284"
+*PaperDimension w227h340/80mm x 120mm:  "227 340"
+*PaperDimension w227h425/80mm x 150mm:  "227 425"
+*PaperDimension w227h567/80mm x 200mm:  "227 567"
+
+*% ── 输入槽 ───────────────────────────────────────────────
+*OpenUI *InputSlot/进纸方式: PickOne
+*OrderDependency: 30 AnySetup *InputSlot
+*DefaultInputSlot: Roll
+*InputSlot Roll/卷纸: ""
+*CloseUI: *InputSlot
+
+*% ── 颜色模式 ─────────────────────────────────────────────
+*OpenUI *ColorModel/颜色: PickOne
+*OrderDependency: 40 AnySetup *ColorModel
+*DefaultColorModel: Gray
+*ColorModel Gray/灰度: "<</cupsColorSpace 0/cupsBitsPerColor 1>>setpagedevice"
+*CloseUI: *ColorModel
+
+*% ── 设备 ID ─────────────────────────────────────────────
+*1284DeviceID: "MFG:HPRT;MDL:HM-A300 Series;CMD:CPCL;CLS:PRINTER;"
+
+*% EOF

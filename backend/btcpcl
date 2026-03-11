@@ -1,0 +1,184 @@
+#!/usr/bin/env python3
+"""
+CUPS 蓝牙后端: btcpcl
+适用于: 支持 CPCL 协议的蓝牙打印机 (HPRT HM-A300/HM-T300 等)
+URI 格式: btcpcl://XX:XX:XX:XX:XX:XX/CHANNEL
+         例如: btcpcl://04:7F:0E:0F:5A:62/1
+
+CUPS 后端调用约定:
+  - 不带参数: 枚举设备 (供打印机管理器自动发现)
+  - 带参数:   执行打印任务 job-id user title copies options [file]
+"""
+
+import sys
+import os
+import socket
+import time
+import subprocess
+import re
+
+# ── 设备识别规则 ──────────────────────────────────────────────
+# 通过蓝牙设备名称或 Class 识别 HPRT CPCL 打印机
+HPRT_NAME_PATTERNS = [
+    r"HM-A300", r"HM-A300E", r"HM-A300S",
+    r"HM-T300",
+    r"HM-E300", r"HM-E200",
+    r"HPRT",
+]
+# Bluetooth Class: 0x000680 = 打印机 (Major: Imaging, Minor: Printer)
+PRINTER_BT_CLASS = "0x000680"
+
+CONNECT_TIMEOUT = 15
+CONNECT_DELAY   = 0.3
+FINISH_DELAY    = 1.5
+CHUNK_SIZE      = 4096
+
+
+def log(msg):
+    sys.stderr.write(f"DEBUG: btcpcl: {msg}\n")
+    sys.stderr.flush()
+
+
+def error(msg):
+    sys.stderr.write(f"ERROR: btcpcl: {msg}\n")
+    sys.stderr.flush()
+
+
+def discover_bluetooth_printers():
+    """
+    从 bluetoothctl 枚举已配对的蓝牙设备，
+    识别出 HPRT CPCL 打印机并返回设备列表。
+    """
+    devices = []
+    try:
+        # 列出所有已知设备
+        result = subprocess.run(
+            ["bluetoothctl", "devices"],
+            capture_output=True, text=True, timeout=5
+        )
+        for line in result.stdout.splitlines():
+            # 格式: Device XX:XX:XX:XX:XX:XX DeviceName
+            m = re.match(r"Device\s+([0-9A-F:]{17})\s+(.*)", line, re.IGNORECASE)
+            if not m:
+                continue
+            mac, name = m.group(1).upper(), m.group(2).strip()
+
+            # 检查设备名称是否匹配 HPRT 打印机
+            is_hprt = any(re.search(p, name, re.IGNORECASE) for p in HPRT_NAME_PATTERNS)
+
+            # 如果名称不匹配，检查蓝牙 Class
+            if not is_hprt:
+                info = subprocess.run(
+                    ["bluetoothctl", "info", mac],
+                    capture_output=True, text=True, timeout=3
+                )
+                if PRINTER_BT_CLASS in info.stdout or "printer" in info.stdout.lower():
+                    is_hprt = True
+
+            if is_hprt:
+                devices.append({"mac": mac, "name": name})
+    except Exception as e:
+        log(f"蓝牙扫描失败: {e}")
+    return devices
+
+
+def list_devices():
+    """枚举设备，CUPS 打印机管理器调用此功能进行自动发现"""
+    printers = discover_bluetooth_printers()
+    for dev in printers:
+        # URI host 部分不允许冒号，用短横线替代
+        mac_dashes  = dev['mac'].replace(':', '-')
+        uri         = f"btcpcl://{mac_dashes}/1"
+        make_model  = f"HPRT {dev['name']}"
+        description = f"{dev['name']} Bluetooth CPCL Printer"
+        device_id   = f"MFG:HPRT;MDL:{dev['name']};CMD:CPCL;"
+        print(f'network {uri} "{make_model}" "{description}" "{device_id}"')
+
+
+def parse_uri(uri):
+    """
+    解析 btcpcl://MAC/channel → (mac, channel)
+    MAC 可以用短横线 (04-7F-0E-0F-5A-62) 或冒号 (04:7F:0E:0F:5A:62)
+    URI host 部分使用短横线，内部转为冒号供 socket 使用
+    """
+    if not uri.startswith("btcpcl://"):
+        raise ValueError(f"无效 URI 格式: {uri}  (应为 btcpcl://XX-XX-XX-XX-XX-XX/1)")
+    path    = uri[len("btcpcl://"):]
+    parts   = path.split("/")
+    # 统一转为冒号格式用于蓝牙连接
+    mac     = parts[0].upper().replace('-', ':')
+    channel = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 1
+    if not re.match(r"^([0-9A-F]{2}:){5}[0-9A-F]{2}$", mac):
+        raise ValueError(f"无效 MAC 地址: {mac}")
+    return mac, channel
+
+
+def send_to_printer(mac, channel, data):
+    """通过蓝牙 RFCOMM 发送数据"""
+    log(f"连接 {mac} ch{channel}")
+    sock = socket.socket(socket.AF_BLUETOOTH, socket.SOCK_STREAM, socket.BTPROTO_RFCOMM)
+    sock.settimeout(CONNECT_TIMEOUT)
+    try:
+        sock.connect((mac, channel))
+        time.sleep(CONNECT_DELAY)
+        log(f"已连接，发送 {len(data)} 字节")
+        sent = 0
+        while sent < len(data):
+            n = sock.send(data[sent : sent + CHUNK_SIZE])
+            sent += n
+        time.sleep(FINISH_DELAY)
+        log("完成")
+    finally:
+        sock.close()
+
+
+def main():
+    argc = len(sys.argv)
+
+    # 不带参数 → 枚举设备
+    if argc == 1:
+        list_devices()
+        sys.exit(0)
+
+    if argc < 6 or argc > 7:
+        sys.stderr.write("Usage: btcpcl job-id user title copies options [file]\n")
+        sys.exit(1)
+
+    device_uri = os.environ.get("DEVICE_URI", "")
+    if not device_uri:
+        error("DEVICE_URI 未设置")
+        sys.exit(1)
+
+    try:
+        mac, channel = parse_uri(device_uri)
+    except ValueError as e:
+        error(str(e))
+        sys.exit(1)
+
+    # 读取打印数据
+    if argc == 7:
+        with open(sys.argv[6], "rb") as f:
+            data = f.read()
+    else:
+        data = sys.stdin.buffer.read()
+
+    if not data:
+        error("无打印数据")
+        sys.exit(1)
+
+    log(f"任务: 用户={sys.argv[2]}  标题={sys.argv[3]}  {len(data)} 字节")
+
+    for attempt in range(3):
+        try:
+            send_to_printer(mac, channel, data)
+            sys.exit(0)
+        except OSError as e:
+            error(f"第 {attempt+1} 次失败: {e}")
+            if attempt < 2:
+                time.sleep(2)
+
+    sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
