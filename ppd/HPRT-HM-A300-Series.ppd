@@ -6,7 +6,7 @@
 *%
 
 *FormatVersion:     "4.3"
-*FileVersion:       "1.1"
+*FileVersion:       "1.2"
 *LanguageVersion:   English
 *LanguageEncoding:  ISOLatin1
 *PCFileName:        "HPRT_HM-A300-Series.ppd"
@@ -67,6 +67,19 @@
 *PageRegion w227h425/80mm x 150mm:  "<</PageSize[227 425]>>setpagedevice"
 *PageRegion w227h567/80mm x 200mm:  "<</PageSize[227 567]>>setpagedevice"
 *CloseUI: *PageRegion
+
+*% ── 自定义纸张尺寸 ───────────────────────────────────────
+*% CUPS 标准机制: 打印对话框会出现「自定义」尺寸，可直接输入宽/高。
+*% 单位: 点 (1pt = 1/72 inch)。227pt = 80mm (机芯最大纸宽)
+*%      36pt = 12.7mm  2268pt = 800mm
+*CustomPageSize True: "pop pop pop <</PageSize[5 -2 roll]/ImagingBBox null>>setpagedevice"
+*ParamCustomPageSize Width:        1 points 36 227
+*ParamCustomPageSize Height:       2 points 36 2268
+*ParamCustomPageSize WidthOffset:  3 points 0 0
+*ParamCustomPageSize HeightOffset: 4 points 0 0
+*ParamCustomPageSize Orientation:  5 int 0 0
+*cupsMinSize: "36 36"
+*cupsMaxSize: "227 2268"
 
 *DefaultImageableArea: w227h284
 *ImageableArea w227h142/80mm x 50mm:   "0 0 227 142"

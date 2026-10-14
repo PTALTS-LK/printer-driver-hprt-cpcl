@@ -4,18 +4,29 @@ CUPS 过滤器: PDF → CPCL
 适用于: HPRT HM-A300 / HM-T300 移动打印机
 协议: CPCL (Comtec Printer Control Language)
 用法: pdftocpcl job-id user title copies options [file]
+
+纸张尺寸: 取自作业选项 PageSize / media，或 PPD 的 *DefaultPageSize。
+        支持 CUPS 标准自定义尺寸写法，例如
+            lp -o PageSize=Custom.80x100mm   (单位可为 mm / cm / in，缺省为点)
+            lp -o media=Custom.60x40mm
+        指定了纸张尺寸时，PDF 会等比缩放后居中放入「可打印宽 × 标签长」，
+        不足部分留白；未指定时按原先的行为（宽度填满）处理。
 """
 
 import sys
 import os
+import re
 import subprocess
 import tempfile
 import shutil
 
 # ── 打印机参数 ──────────────────────────────────────────────
 PRINTER_DPI         = 200     # 打印机分辨率
-PRINTABLE_WIDTH_MM  = 72.0    # 可打印宽度 (80mm 纸约 72mm)
-PRINTABLE_WIDTH_PX  = int(PRINTABLE_WIDTH_MM / 25.4 * PRINTER_DPI)  # ≈566 像素
+MAX_PRINT_WIDTH_MM  = 72.0    # 打印头可打印宽度上限 (576 点 @200dpi ≈ 72mm)
+PRINTABLE_WIDTH_PX  = int(MAX_PRINT_WIDTH_MM / 25.4 * PRINTER_DPI)  # ≈566 像素
+PT_TO_MM            = 25.4 / 72.0
+MIN_RENDER_DPI      = 10
+MAX_RENDER_DPI      = 1200
 # ────────────────────────────────────────────────────────────
 
 
@@ -44,6 +55,77 @@ def pdf_page_size_pts(pdf_path):
     except Exception as e:
         log(f"pdfinfo 失败: {e}")
     return None, None
+
+
+# ── 纸张尺寸解析 ────────────────────────────────────────────
+# CUPS 把作业选项放在 argv[5]，形如 "PageSize=Custom.80x100mm Resolution=200dpi"，
+# 属性名与 IPP 一致（media 是 PageSize 的别名）。
+# 命名尺寸靠 PPD 的 *PageSize 定义解析，自定义尺寸用 CUPS 的
+# "Custom.<宽>x<高>[单位]" 写法（单位 mm/cm/in，缺省为点）。
+
+_CUSTOM_SIZE_RE = re.compile(
+    r"^custom[._]\s*([0-9]+(?:\.[0-9]+)?)\s*x\s*([0-9]+(?:\.[0-9]+)?)\s*(mm|cm|in|pt)?$",
+    re.IGNORECASE,
+)
+_UNIT_TO_MM = {"mm": 1.0, "cm": 10.0, "in": 25.4, "pt": PT_TO_MM}
+
+
+def clamp_dpi(dpi):
+    return int(max(MIN_RENDER_DPI, min(MAX_RENDER_DPI, round(dpi))))
+
+
+def parse_options(option_string):
+    """解析 CUPS 选项字符串 → {小写属性名: 值}"""
+    options = {}
+    for token in option_string.split():
+        if "=" in token:
+            name, value = token.split("=", 1)
+            options[name.lower()] = value
+    return options
+
+
+def custom_media_mm(value):
+    """解析 Custom.80x100mm / custom_60x40mm → (宽mm, 高mm)；不是自定义尺寸则 None"""
+    m = _CUSTOM_SIZE_RE.match(value.strip())
+    if not m:
+        return None
+    factor = _UNIT_TO_MM[(m.group(3) or "pt").lower()]
+    return float(m.group(1)) * factor, float(m.group(2)) * factor
+
+
+def ppd_media_mm(ppd_path, name=None):
+    """从 PPD 查询纸张尺寸 → (宽mm, 高mm)；name 为空时取 *DefaultPageSize"""
+    if not ppd_path or not os.path.isfile(ppd_path):
+        return None
+    try:
+        with open(ppd_path, "r", errors="replace") as f:
+            text = f.read()
+    except OSError:
+        return None
+    if not name:
+        m = re.search(r"^\*DefaultPageSize:\s*(\S+)", text, re.MULTILINE)
+        if not m:
+            return None
+        name = m.group(1)
+    m = re.search(
+        r"^\*PageSize\s+" + re.escape(name) + r"(?:/[^:]*)?:\s*"
+        r"\"<</PageSize\s*\[\s*([0-9.]+)\s+([0-9.]+)\s*\]",
+        text, re.MULTILINE,
+    )
+    if not m:
+        return None
+    return float(m.group(1)) * PT_TO_MM, float(m.group(2)) * PT_TO_MM
+
+
+def resolve_media_mm(options):
+    """确定作业的纸张尺寸 (宽mm, 高mm)，无法确定时返回 None"""
+    ppd_path = os.environ.get("PPD")
+    value = options.get("pagesize") or options.get("media")
+    if value:
+        size = custom_media_mm(value) or ppd_media_mm(ppd_path, value)
+        if size:
+            return size
+    return ppd_media_mm(ppd_path)
 
 
 def render_pdf_to_pbm(pdf_path, render_dpi, tmpdir):
@@ -105,7 +187,29 @@ def read_pbm(path):
     return width, height, rows
 
 
-def build_cpcl(width_px, height_px, rows):
+def place_bitmap(rows, dst_width, dst_height, x_offset, y_offset):
+    """
+    把位图放到 dst_width × dst_height 的画布上（不裁剪、不变形，不足处留白）。
+    返回 dst_height 行、每行 ceil(dst_width/8) 字节的位图。
+    超出画布的部分会被裁掉。
+    """
+    dst_bytes = (dst_width + 7) // 8
+    total_bits = dst_bytes * 8
+    # 每行用的是大端位串，第 0 位在最左边；画布右侧不足一字节的补位必须保持为 0
+    mask = ((1 << dst_width) - 1) << (total_bits - dst_width)
+    canvas = [0] * dst_height
+    for y, row in enumerate(rows):
+        dst_y = y_offset + y
+        if not 0 <= dst_y < dst_height:
+            continue
+        value = int.from_bytes(bytes(row), "big")
+        shift = total_bits - len(row) * 8 - x_offset
+        value = value << shift if shift >= 0 else value >> -shift
+        canvas[dst_y] |= value & mask
+    return [bytearray(v.to_bytes(dst_bytes, "big")) for v in canvas]
+
+
+def build_cpcl(width_px, rows):
     """
     构建 CPCL EG (EXPANDED-GRAPHICS) 打印命令。
 
@@ -115,7 +219,8 @@ def build_cpcl(width_px, height_px, rows):
       FORM\\r\\n
       PRINT\\r\\n
     """
-    w_bytes = (min(width_px, PRINTABLE_WIDTH_PX) + 7) // 8
+    height_px = len(rows)
+    w_bytes = (width_px + 7) // 8
 
     # 构建 hex 数据（每字节→2个十六进制字符）
     hex_parts = []
@@ -141,8 +246,8 @@ def main():
         )
         sys.exit(1)
 
-    options = sys.argv[5]
-    log(f"任务选项: {options}")
+    options = parse_options(sys.argv[5])
+    log(f"任务选项: {sys.argv[5]}")
 
     tmpdir = tempfile.mkdtemp(prefix="pdftocpcl_")
     try:
@@ -155,18 +260,36 @@ def main():
             with open(input_pdf, "wb") as f:
                 f.write(sys.stdin.buffer.read())
 
-        # 获取 PDF 尺寸
+        # 纸张尺寸（作业选项或 PPD）与 PDF 尺寸
+        media = resolve_media_mm(options)
         w_pts, h_pts = pdf_page_size_pts(input_pdf)
-        if w_pts is None:
+        pdf_w_mm = pdf_h_mm = None
+        if w_pts and h_pts:
+            pdf_w_mm, pdf_h_mm = w_pts * PT_TO_MM, h_pts * PT_TO_MM
+            log(f"PDF 尺寸: {pdf_w_mm:.1f}mm x {pdf_h_mm:.1f}mm")
+
+        # 计算渲染 DPI 与输出画布
+        canvas = None
+        if media and pdf_w_mm:
+            # 指定了纸张：等比缩放到刚好放进「可打印宽 × 标签长」
+            # 可打印宽 = min(纸宽, 打印头宽度上限)，窄纸可 1:1 输出
+            printable_mm = max(1.0, min(media[0], MAX_PRINT_WIDTH_MM))
+            scale = min(printable_mm / pdf_w_mm, media[1] / pdf_h_mm)
+            render_dpi = clamp_dpi(PRINTER_DPI * scale)
+            canvas = (
+                max(1, round(printable_mm / 25.4 * PRINTER_DPI)),
+                max(1, round(media[1] / 25.4 * PRINTER_DPI)),
+            )
+            log(f"纸张尺寸: {media[0]:.1f}mm x {media[1]:.1f}mm  "
+                f"可打印宽: {printable_mm:.1f}mm  画布: {canvas[0]}x{canvas[1]}px")
+        elif pdf_w_mm:
+            # 未指定纸张：保持原行为，按宽度铺满打印宽度
+            render_dpi = clamp_dpi(PRINTER_DPI * (MAX_PRINT_WIDTH_MM / pdf_w_mm))
+            log(f"未指定纸张尺寸，按宽度铺满 {MAX_PRINT_WIDTH_MM:.0f}mm")
+        else:
             error("无法获取 PDF 尺寸，使用默认 DPI")
             render_dpi = PRINTER_DPI
-        else:
-            w_mm = w_pts / 72.0 * 25.4
-            h_mm = h_pts / 72.0 * 25.4
-            log(f"PDF 尺寸: {w_mm:.1f}mm x {h_mm:.1f}mm")
-            # 缩放 DPI 使内容铺满打印宽度
-            render_dpi = int(PRINTER_DPI * (PRINTABLE_WIDTH_MM / w_mm))
-            log(f"渲染 DPI: {render_dpi} (缩放比 {render_dpi/PRINTER_DPI:.2f}x)")
+        log(f"渲染 DPI: {render_dpi} (缩放比 {render_dpi / PRINTER_DPI:.2f}x)")
 
         # 渲染 PDF 为位图
         pbm_files = render_pdf_to_pbm(input_pdf, render_dpi, tmpdir)
@@ -179,8 +302,17 @@ def main():
         # 逐页转换并输出 CPCL
         for i, pbm in enumerate(pbm_files):
             width, height, rows = read_pbm(pbm)
-            log(f"第 {i+1} 页: {width}x{height}px ({width/PRINTER_DPI*25.4:.1f}x{height/PRINTER_DPI*25.4:.1f}mm)")
-            cpcl = build_cpcl(width, height, rows)
+            if canvas:
+                out_w, out_h = canvas
+                rows = place_bitmap(
+                    rows, out_w, out_h,
+                    max(0, (out_w - width) // 2),
+                    max(0, (out_h - height) // 2),
+                )
+            else:
+                out_w, out_h = min(width, PRINTABLE_WIDTH_PX), height
+            log(f"第 {i+1} 页: {out_w}x{out_h}px ({out_w/PRINTER_DPI*25.4:.1f}x{out_h/PRINTER_DPI*25.4:.1f}mm)")
+            cpcl = build_cpcl(out_w, rows)
             sys.stdout.buffer.write(cpcl.encode('ascii'))
 
         log("转换完成")
